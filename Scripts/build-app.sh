@@ -412,12 +412,14 @@ fi
 # The Sparkle feed, public key, and the optional support/telemetry worker can be
 # overridden via environment so forks can ship their own update channel without
 # patching this script:
-#   KASET_SU_FEED_URL       Sparkle appcast URL (leave empty to disable updates)
+#   KASET_SU_FEED_URL       Sparkle appcast URL (set to empty to disable updates)
 #   KASET_SU_PUBLIC_ED_KEY  EdDSA public key matching your SPARKLE_PRIVATE_KEY
 #   KASET_SUPPORT_WORKER_URL  Cloudflare Worker for Ko-fi verification/telemetry
-SU_FEED_URL=${KASET_SU_FEED_URL:-"https://raw.githubusercontent.com/Yoddikko/kasetPlus/main/appcast.xml"}
-SU_PUBLIC_ED_KEY=${KASET_SU_PUBLIC_ED_KEY:-"ev8BOn34ZbVJn2FonYjxi2tAtNDJmgCET3NcklUJl9o="}
-SUPPORT_WORKER_URL=${KASET_SUPPORT_WORKER_URL:-"https://kaset-lastfm.alessioiodiceuni.workers.dev"}
+# Note: these use ${VAR-default} (not ${VAR:-default}) so that exporting an
+# explicitly empty value disables the endpoint instead of falling back.
+SU_FEED_URL=${KASET_SU_FEED_URL-"https://raw.githubusercontent.com/Yoddikko/kasetPlus/main/appcast.xml"}
+SU_PUBLIC_ED_KEY=${KASET_SU_PUBLIC_ED_KEY-"ev8BOn34ZbVJn2FonYjxi2tAtNDJmgCET3NcklUJl9o="}
+SUPPORT_WORKER_URL=${KASET_SUPPORT_WORKER_URL-"https://kaset-lastfm.alessioiodiceuni.workers.dev"}
 
 SPARKLE_PLIST=""
 if [[ -n "$SU_FEED_URL" ]]; then
