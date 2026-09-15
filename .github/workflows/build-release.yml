@@ -1,0 +1,240 @@
+name: Build & Release
+
+# Slim release pipeline for this fork: builds a universal binary on a tag push,
+# ad-hoc signs it (no Apple Developer account needed), packages a DMG, and
+# publishes a GitHub Release. Optionally signs the DMG for Sparkle auto-updates
+# when the SPARKLE_PRIVATE_KEY / SPARKLE_PUBLIC_KEY secrets are configured.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version label used for the release name and DMG filename"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Cache SPM dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm/spm-repositories
+          key: ${{ runner.os }}-spm-release-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-release-
+
+      - name: Clear SPM binary artifacts cache
+        run: rm -rf ~/Library/Caches/org.swift.swiftpm/artifacts
+
+      - name: Resolve tag and version
+        id: version
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          TAG="${TAG:-v0.0.0}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "filename=KasetPlus-${TAG}.dmg" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG (version $VERSION)"
+
+      - name: Configure Sparkle update feed
+        id: sparkle_cfg
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
+        run: |
+          # If a public EdDSA key secret is configured, point the app at this
+          # repo's appcast so Sparkle auto-updates work. Otherwise ship with no
+          # feed URL — Sparkle simply never checks for updates.
+          if [ -n "$SPARKLE_PUBLIC_KEY" ]; then
+            FEED="https://raw.githubusercontent.com/${{ github.repository }}/main/appcast.xml"
+            echo "feed_url=$FEED" >> "$GITHUB_OUTPUT"
+            echo "ed_key=$SPARKLE_PUBLIC_KEY" >> "$GITHUB_OUTPUT"
+            echo "Sparkle updates enabled: $FEED"
+          else
+            echo "feed_url=" >> "$GITHUB_OUTPUT"
+            echo "ed_key=" >> "$GITHUB_OUTPUT"
+            echo "Sparkle updates disabled (no SPARKLE_PUBLIC_KEY secret)."
+          fi
+
+      - name: Build release app (universal, ad-hoc signed)
+        env:
+          KASET_SIGNING: adhoc
+          ARCHES: "arm64 x86_64"
+          KASET_SU_FEED_URL: ${{ steps.sparkle_cfg.outputs.feed_url }}
+          KASET_SU_PUBLIC_ED_KEY: ${{ steps.sparkle_cfg.outputs.ed_key }}
+          KASET_SUPPORT_WORKER_URL: ""
+        run: |
+          echo "MARKETING_VERSION=${{ steps.version.outputs.version }}" > version.env
+          echo "BUILD_NUMBER=${{ github.run_number }}" >> version.env
+          Scripts/build-app.sh release
+
+      - name: Verify signature
+        run: |
+          APP=".build/app/KasetPlus.app"
+          test -d "$APP" || { echo "App bundle missing"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Identifier|Signature|Authority" || true
+          lipo -archs "$APP/Contents/MacOS/KasetPlus" | tee /dev/stderr | \
+            grep -q x86_64 && grep -q arm64 <<< "$(lipo -archs "$APP/Contents/MacOS/KasetPlus")" \
+            || { echo "Not a universal binary"; exit 1; }
+          # Confirm no third-party worker endpoint was baked in
+          if plutil -p "$APP/Contents/Info.plist" | grep -q SupportWorkerURL; then
+            echo "ERROR: SupportWorkerURL must not be set in this build" >&2
+            exit 1
+          fi
+
+      - name: Create DMG
+        run: |
+          APP=".build/app/KasetPlus.app"
+          hdiutil create -volname "KasetPlus" -srcfolder "$APP" \
+            -ov -format UDZO kasetplus.dmg
+          mv kasetplus.dmg "${{ steps.version.outputs.filename }}"
+
+      - name: Checksum
+        id: sha256
+        run: |
+          SHA=$(shasum -a 256 "${{ steps.version.outputs.filename }}" | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $SHA"
+
+      - name: Sign DMG for Sparkle
+        id: sparkle_sign
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "signature=" >> "$GITHUB_OUTPUT"; echo "length=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SIGN_UPDATE=$(find .build -name sign_update -type f 2>/dev/null | head -1)
+          if [ -z "$SIGN_UPDATE" ]; then
+            SIGN_UPDATE=$(find ~/Library/Caches/org.swift.swiftpm -name sign_update -type f 2>/dev/null | head -1)
+          fi
+          if [ -z "$SIGN_UPDATE" ]; then
+            echo "::warning::sign_update not found; skipping Sparkle signature"
+            echo "signature=" >> "$GITHUB_OUTPUT"; echo "length=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          KEY_FILE=$(mktemp "$RUNNER_TEMP/sparkle-key.XXXXXX")
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"; chmod 600 "$KEY_FILE"
+          OUT=$("$SIGN_UPDATE" --ed-key-file "$KEY_FILE" "${{ steps.version.outputs.filename }}")
+          SIG=$(echo "$OUT" | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/.*="//;s/"$//')
+          echo "signature=$SIG" >> "$GITHUB_OUTPUT"
+          echo "length=$(stat -f%z "${{ steps.version.outputs.filename }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PREV_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -A1 "^${TAG}$" | tail -1 || true)
+          if [ "$PREV_TAG" = "$TAG" ] || [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          fi
+          {
+            echo "## KasetPlus ${TAG}"
+            echo ""
+            echo "Personal CI build of [Yoddikko/kasetPlus](https://github.com/Yoddikko/kasetPlus) (fork of [sozercan/kaset](https://github.com/sozercan/kaset))."
+            echo ""
+            echo "- Built by GitHub Actions from the tagged commit — see the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for provenance"
+            echo "- Ad-hoc signed, universal (Apple Silicon + Intel), macOS 15.4+"
+            echo "- Telemetry/support worker and Sparkle update feed removed or repointed"
+            echo ""
+            echo '```'
+            echo "SHA256  ${{ steps.sha256.outputs.sha256 }}"
+            echo '```'
+            echo ""
+            echo '**Install:** the build is unsigned/ad-hoc so Gatekeeper will block it. After copying to /Applications run:'
+            echo '```sh'
+            echo 'xattr -cr /Applications/KasetPlus.app'
+            echo '```'
+            echo ""
+            if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$TAG" ]; then
+              echo "### Changes since ${PREV_TAG}"
+              git log --pretty=format:"- %s" "${PREV_TAG}..${TAG}" --no-merges | head -50
+            fi
+          } > release_notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          FILE="${{ steps.version.outputs.filename }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$FILE" --clobber
+          else
+            gh release create "$TAG" "$FILE" \
+              --title "KasetPlus ${TAG}" \
+              --notes-file release_notes.md
+          fi
+
+      - name: Update appcast
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SIG="${{ steps.sparkle_sign.outputs.signature }}"
+          [ -z "$SIG" ] && { echo "No Sparkle signature; skipping appcast."; exit 0; }
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          FILE="${{ steps.version.outputs.filename }}"
+          LENGTH="${{ steps.sparkle_sign.outputs.length }}"
+          PUB_DATE=$(date -u "+%a, %d %b %Y %H:%M:%S %z")
+          cat > appcast.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+              <title>KasetPlus Updates</title>
+              <link>https://github.com/${{ github.repository }}/releases</link>
+              <item>
+                <title>Version ${VERSION}</title>
+                <sparkle:releaseNotesLink>https://github.com/${{ github.repository }}/releases/tag/${TAG}</sparkle:releaseNotesLink>
+                <pubDate>${PUB_DATE}</pubDate>
+                <enclosure url="https://github.com/${{ github.repository }}/releases/download/${TAG}/${FILE}"
+                  sparkle:version="${{ github.run_number }}"
+                  sparkle:shortVersionString="${VERSION}"
+                  length="${LENGTH}"
+                  type="application/octet-stream"
+                  sparkle:edSignature="${SIG}"/>
+                <sparkle:minimumSystemVersion>15.4</sparkle:minimumSystemVersion>
+              </item>
+            </channel>
+          </rss>
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B appcast-update
+          git add appcast.xml
+          git commit -m "Update appcast to ${TAG}" || exit 0
+          git push origin appcast-update
+          gh pr create --base main --head appcast-update \
+            --title "Update appcast to ${TAG}" --body "Automated Sparkle appcast update." || true

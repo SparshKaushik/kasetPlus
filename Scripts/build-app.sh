@@ -409,6 +409,43 @@ if [[ ${#SWIFTPM_BUNDLES[@]} -gt 0 ]]; then
 fi
 
 # ── Info.plist ────────────────────────────────────────────────────────────────
+# The Sparkle feed, public key, and the optional support/telemetry worker can be
+# overridden via environment so forks can ship their own update channel without
+# patching this script:
+#   KASET_SU_FEED_URL       Sparkle appcast URL (leave empty to disable updates)
+#   KASET_SU_PUBLIC_ED_KEY  EdDSA public key matching your SPARKLE_PRIVATE_KEY
+#   KASET_SUPPORT_WORKER_URL  Cloudflare Worker for Ko-fi verification/telemetry
+SU_FEED_URL=${KASET_SU_FEED_URL:-"https://raw.githubusercontent.com/Yoddikko/kasetPlus/main/appcast.xml"}
+SU_PUBLIC_ED_KEY=${KASET_SU_PUBLIC_ED_KEY:-"ev8BOn34ZbVJn2FonYjxi2tAtNDJmgCET3NcklUJl9o="}
+SUPPORT_WORKER_URL=${KASET_SUPPORT_WORKER_URL:-"https://kaset-lastfm.alessioiodiceuni.workers.dev"}
+
+SPARKLE_PLIST=""
+if [[ -n "$SU_FEED_URL" ]]; then
+  SPARKLE_PLIST=$(cat <<SPARKLE_EOF
+    <!-- Sparkle Auto-Update Configuration -->
+    <key>SUFeedURL</key>
+    <string>${SU_FEED_URL}</string>
+    <key>SUPublicEDKey</key>
+    <string>${SU_PUBLIC_ED_KEY}</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+    <key>SUAllowsAutomaticUpdates</key>
+    <true/>
+SPARKLE_EOF
+)
+fi
+
+SUPPORT_PLIST=""
+if [[ -n "$SUPPORT_WORKER_URL" ]]; then
+  SUPPORT_PLIST=$(cat <<SUPPORT_EOF
+    <!-- KasetPlus support (Ko-fi) — Cloudflare Worker for supporter verification -->
+    <key>SupportWorkerURL</key>
+    <string>${SUPPORT_WORKER_URL}</string>
+SUPPORT_EOF
+)
+fi
 
 APP_LOCALIZATIONS_PLIST=$(emit_bundle_localizations_plist "$APP_BUNDLE/Contents/Resources" "$DEVELOPMENT_LOCALIZATION")
 
@@ -477,19 +514,7 @@ ${APP_LOCALIZATIONS_PLIST}
         </dict>
     </array>
 
-    <!-- Sparkle Auto-Update Configuration -->
-    <key>SUFeedURL</key>
-    <string>https://raw.githubusercontent.com/Yoddikko/kasetPlus/main/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>ev8BOn34ZbVJn2FonYjxi2tAtNDJmgCET3NcklUJl9o=</string>
-    <key>SUEnableAutomaticChecks</key>
-    <true/>
-    <key>SUScheduledCheckInterval</key>
-    <integer>86400</integer>
-    <key>SUAllowsAutomaticUpdates</key>
-    <true/>
-    <key>SUEnableInstallerLauncherService</key>
-    <true/>
+${SPARKLE_PLIST}
 
     <!-- AppleScript Support -->
     <key>NSAppleScriptEnabled</key>
@@ -503,9 +528,7 @@ ${APP_LOCALIZATIONS_PLIST}
     <key>NSScreenCaptureUsageDescription</key>
     <string>KasetPlus taps its own audio output (not the screen) so the built-in equalizer can apply effects to your music. No screen content is recorded.</string>
 
-    <!-- KasetPlus support (Ko-fi) — Cloudflare Worker for supporter verification -->
-    <key>SupportWorkerURL</key>
-    <string>https://kaset-lastfm.alessioiodiceuni.workers.dev</string>
+${SUPPORT_PLIST}
 
     <!-- Build Metadata -->
     <key>KasetBuildTimestamp</key>

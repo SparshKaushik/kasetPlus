@@ -5,9 +5,10 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Tag-triggered releases are handled by .github/workflows/build-release.yml
+  # in this fork. This upstream pipeline stays available for manual runs only —
+  # it requires unit tests to pass plus Homebrew-tap and signing secrets that
+  # this fork does not configure.
   workflow_dispatch:
     inputs:
       tag:
